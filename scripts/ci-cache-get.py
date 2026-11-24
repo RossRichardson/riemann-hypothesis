@@ -398,14 +398,17 @@ def download_failure(code, report):
 
 def import_headers(root, paths, env):
     """Use the pinned Lean header parser, without elaborating or importing a module."""
-    result = subprocess.run(["elan", "run", env["ELAN_TOOLCHAIN"], "lean", "--deps-json", "--stdin"],
-                            cwd=root, env=env,
-                            input="".join(f"{path}\n" for path in paths), stdout=subprocess.PIPE,
-                            text=True, check=True)
-    for path, header in zip(paths, json.loads(result.stdout)["imports"], strict=True):
-        if header.get("errors") or "result" not in header:
-            raise ValueError(f"could not read imports from {path}: {header.get('errors')}")
-        yield [item["module"] for item in header["result"]["imports"]]
+    # Each invocation returns a single JSON document, even for thousands of sibling imports.
+    batch_size = 512
+    for start in range(0, len(paths), batch_size):
+        batch = paths[start:start + batch_size]
+        result = subprocess.run(["elan", "run", env["ELAN_TOOLCHAIN"], "lean", "--deps-json", "--stdin"],
+                                cwd=root, env=env, input="".join(f"{path}\n" for path in batch),
+                                stdout=subprocess.PIPE, text=True, check=True)
+        for path, header in zip(batch, json.loads(result.stdout)["imports"], strict=True):
+            if header.get("errors") or "result" not in header:
+                raise ValueError(f"could not read imports from {path}: {header.get('errors')}")
+            yield [item["module"] for item in header["result"]["imports"]]
 
 
 def target_imports(root, targets, modules, env):
