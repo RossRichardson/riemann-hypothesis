@@ -43,13 +43,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rh-ci-client-") as temporary:
         root = Path(temporary)
         (root / "src").mkdir()
-        (root / "src/Subject.lean").write_text("def answer : Nat := 42\ntheorem yes : True := True.intro\n")
+        sources = {"Support": "def support : Nat := 42",
+                   "Middle": "import Support\ndef middle : Nat := support",
+                   "Subject": "import Middle\ndef answer : Nat := middle",
+                   "Unrelated": "def unrelated : Nat := 7"}
+        for name, source in sources.items():
+            (root / "src" / (name + ".lean")).write_text(source + "\n")
         (root / "lean-toolchain").write_text(publisher.transport.TOOLCHAIN + "\n")
         (root / "lakefile.toml").write_text('''name = "ciCacheFixture"
 srcDir = "src"
 defaultTargets = ["Subject"]
 [[lean_lib]]
 name = "Subject"
+roots = ["Subject", "Middle", "Support", "Unrelated"]
 [cache]
 defaultService = "fixture"
 [[cache.service]]
@@ -67,21 +73,26 @@ revisionEndpoint = "https://example.invalid/revisions"
         lib, ir = root / ".lake/build/lib/lean", root / ".lake/build/ir"
         originals = {ext: (ir if ext == "c" else lib).joinpath("Subject." + ext).read_bytes()
                      for ext in ("olean", "ilean", "c")}
-        input_hash = json.loads((lib / "Subject.trace").read_text())["depHash"]
         cache = root / ".lake/cache"
         (cache / "artifacts").mkdir(parents=True)
-        archive = cache / "artifacts/temporary.ltar"
+        public = root / "public-fixture"
+        bucket = public / "artifacts" / client.REPOSITORY
+        bucket.mkdir(parents=True)
+        archives = {name: root / (name + ".ltar") for name in sources}
         leantar = Path(run(root, "elan", "which", "lean")).with_name("leantar")
-        run(root, str(leantar), "-s", "-C", str(lib), "-C", str(ir), str(archive), "Subject.trace",
-            "-i", "0", "Subject.olean", "-i", "0", "Subject.ilean", "-i", "1", "Subject.c")
-        hashed = publisher.lake_hashes({"Subject": archive}, root)
-        artifact = hashed["Subject"] + ".ltar"
-        archive = archive.rename(cache / "artifacts" / artifact)
-        mapping = client.canonical("2026-03-17") + b"\n" + client.canonical([input_hash, artifact]) + b"\n"
+        for name, path in archives.items():
+            run(root, str(leantar), "-s", "-C", str(lib), "-C", str(ir), str(path), name + ".trace",
+                "-i", "0", name + ".olean", "-i", "0", name + ".ilean", "-i", "1", name + ".c")
+        hashes = publisher.lake_hashes(archives, root)
+        rows = {name: [name, json.loads((lib / (name + ".trace")).read_bytes())["depHash"],
+                       hashes[name] + ".ltar", client.digest(path.read_bytes())] for name, path in archives.items()}
+        row = rows["Subject"]
+        artifact = row[2]
+        archive = cache / "artifacts" / artifact
+        mapping = b"\n".join([client.canonical(client.SCHEMA), *(client.canonical(r[1:3]) for r in rows.values())]) + b"\n"
         header = {"schema": 1, **identity, "input_fingerprint": client.fingerprint(identity),
-                  "map_sha256": client.digest(mapping), "modules": 1}
-        row = ["Subject", input_hash, artifact, client.digest(archive.read_bytes())]
-        manifest = gzip.compress(client.canonical(header) + b"\n" + client.canonical(row) + b"\n", mtime=0)
+                  "map_sha256": client.digest(mapping), "modules": len(rows)}
+        manifest = gzip.compress(b"\n".join(map(client.canonical, [header, *rows.values()])) + b"\n", mtime=0)
         record = {"schema": 1, "repository": client.REPOSITORY, **identity,
                   "candidate_head": head, "candidate_tree": run(root, "git", "rev-parse", "HEAD^{tree}"),
                   "input_fingerprint": client.fingerprint(identity), "build_exit_code": 0,
@@ -108,28 +119,36 @@ revisionEndpoint = "https://example.invalid/revisions"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("0" * 16)
         # Downloads come from a file:// copy of the public layout; the local copy starts corrupt.
-        public = root / "public-fixture"
-        published = public / "artifacts" / client.REPOSITORY / (artifact[:-5] + ".art")
-        published.parent.mkdir(parents=True)
-        shutil.copy(archive, published)
-        archive.chmod(0o644)
+        for name in ("Subject", "Middle", "Support"):
+            shutil.copyfile(archives[name], bucket / (hashes[name] + ".art"))
+        published = bucket / (hashes["Subject"] + ".art")
         archive.write_bytes(b"corrupt")
         with patch.object(client, "PUBLIC_BASE", public.as_uri()):
+            client.consume(root, cache, selected, identity, fetcher=fetch, targets=["Subject", "Middle", "Subject"])
+        assert {p.name for p in (cache / "artifacts").glob("*.ltar")} == {rows[n][2] for n in ("Subject", "Middle", "Support")}
+        assert not (lib / "Unrelated.olean").exists()
+        assert not (cache / "outputs/ciCacheFixture" / (rows["Unrelated"][1] + ".json")).exists()
+        run(root, "lake", "--no-build", "--rehash", "build", "+Subject")
+        rejects(lambda: run(root, "lake", "--no-build", "build"))
+        # A plain restore extends this same partial checkout to every default target.
+        shutil.copyfile(archives["Unrelated"], bucket / (hashes["Unrelated"] + ".art"))
+        with patch.object(client, "PUBLIC_BASE", public.as_uri()):
             client.consume(root, cache, selected, identity, fetcher=fetch)
+        assert (lib / "Unrelated.olean").is_file()
         assert client.digest(archive.read_bytes()) == row[3]
         # Lake's unpack clears them; any it writes afterwards describe the restored files.
         assert not any(path.exists() and path.read_text() == "0" * 16 for path in stale)
         for ext, data in originals.items():
             assert (ir if ext == "c" else lib).joinpath("Subject." + ext).read_bytes() == data
         assert "up-to-date" in run(root, "lake", "--no-build", "--rehash", "build", "Subject")
-        assert requests == [index, record["map_key"], record["module_manifest_key"]]
+        assert requests == [index] + [record["map_key"], record["module_manifest_key"]] * 2
         # A published artifact whose bytes differ from the manifest's SHA-256 is never accepted.
         shutil.rmtree(root / ".lake/build")
         archive.unlink()
         published.write_bytes(b"tampered")
         with patch.object(client, "PUBLIC_BASE", public.as_uri()):
             try:
-                client.consume(root, cache, selected, identity, fetcher=fetch)
+                client.consume(root, cache, selected, identity, fetcher=fetch, targets=["Subject"])
             except ValueError as error:
                 assert "1 of the downloads did not match the manifest's SHA-256" in str(error), error
             else:
@@ -169,11 +188,14 @@ revisionEndpoint = "https://example.invalid/revisions"
         objects[record["map_key"]] = mapping + b"corrupt"
         rejects(lambda: client.validated_blobs(record, identity, fetch))
         objects[record["map_key"]] = mapping
-        bad_manifest = gzip.compress(client.canonical(header) + b"\n" + client.canonical(["../escape", *row[1:]]) + b"\n", mtime=0)
+        # Validate the whole manifest, including rows outside the requested closure.
+        bad_rows = [*list(rows.values())[:-1], ["../escape", *rows["Unrelated"][1:]]]
+        bad_manifest = gzip.compress(b"\n".join(map(client.canonical, [header, *bad_rows])) + b"\n", mtime=0)
         bad = {**record, "module_manifest_sha256": client.digest(bad_manifest), "module_manifest_bytes": len(bad_manifest),
                "module_manifest_key": f"ci/module-manifests/{client.digest(bad_manifest)}.jsonl.gz"}
         objects[bad["module_manifest_key"]] = bad_manifest
         rejects(lambda: client.validated_blobs(bad, identity, fetch))
+        rejects(lambda: client.consume(root, cache, bad, identity, fetcher=fetch, targets=["Subject"]))
         source = root / "src/Subject.lean"
         original = source.read_bytes()
         source.write_bytes(original + b"--dirty\n")

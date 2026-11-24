@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regression tests for restore paths and helper preflight."""
 import importlib.util
+import io
 import os
 from pathlib import Path
 import signal
@@ -64,6 +65,43 @@ def worker(kind, *args):
 class RestorePathTests(unittest.TestCase):
     def setUp(self):
         self.helper = load("restore_fixture", SCRIPTS / "ci-cache-get.py")
+
+    def test_module_selection_reads_the_union_of_project_imports(self):
+        imports = {"Left": ["Dep.Θ", "Mathlib.One"], "Right": ["Dep.Θ", "Batteries.Two"],
+                   "Dep.Θ": ["Init", "Std.Data", "Mathlib.One"], "Unrelated": []}
+        rows = [(name, "", "") for name in imports]
+        parsed = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in imports:
+                path = root.joinpath("src", *name.split(".")).with_suffix(".lean")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            def headers(_root, paths, _env):
+                for path in paths:
+                    name = ".".join(path.relative_to("src").with_suffix("").parts)
+                    parsed.append(name)
+                    yield imports[name]
+
+            with patch.object(self.helper, "import_headers", headers):
+                selected, packages = self.helper.target_imports(root, ["Right", "Left", "Right"], rows, {})
+                self.assertEqual(selected, {"Right", "Left", "Dep.Θ"})
+                self.assertCountEqual(parsed, selected)
+                self.assertEqual(packages, ["Batteries.Two", "Mathlib.One"])
+                with self.assertRaisesRegex(ValueError, "Unknown"):
+                    self.helper.target_imports(root, ["Unknown"], rows, {})
+                with self.assertRaisesRegex(ValueError, "Dep.Θ"):
+                    self.helper.target_imports(root, ["Left"], [row for row in rows if row[0] != "Dep.Θ"], {})
+
+    def test_bad_module_arguments_fail_before_cache_lookup(self):
+        with patch.object(self.helper, "current_identity", side_effect=AssertionError("unexpected lookup")), \
+                patch.object(sys, "stderr", new_callable=io.StringIO):
+            for target in ["+Subject", "src/Subject.lean", "../Subject", "A..B", "--jobs"]:
+                with self.subTest(target=target), patch.object(sys, "argv", ["ci-cache-get.py", "--", target]), \
+                        self.assertRaises(SystemExit) as error:
+                    self.helper.main()
+                self.assertEqual(error.exception.code, 2)
 
     def test_valid_paths_preserve_results_and_ancestor_closed_memo(self):
         with tempfile.TemporaryDirectory() as temporary:
