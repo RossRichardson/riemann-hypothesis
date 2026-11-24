@@ -65,9 +65,9 @@ def lib_of(mod):
 
 
 class Module:
-    __slots__ = ("name", "path", "header", "body", "imports", "lines", "exotic", "decls")
+    __slots__ = ("name", "path", "header", "body", "imports", "lines", "exotic", "decls", "clumped", "scopes")
 
-    def __init__(self, name, path, text):
+    def __init__(self, name, path, text, *, keep_source=True):
         self.name = name
         self.path = path
         lines = text.split("\n")
@@ -83,22 +83,27 @@ class Module:
                 mods = m.group(1).split()
                 if m.group(2) or "meta" in mods:
                     exotic = True
-                imports.append((m.group(3), "public" in mods))
+                imports.append((sys.intern(m.group(3)), "public" in mods))
                 continue
             h = i
             break
         else:
             h = len(lines)
-        self.header = "\n".join(lines[:h]) + ("\n" if h < len(lines) else "")
-        self.body = "\n".join(lines[h:])
+        body = "\n".join(lines[h:])
+        self.clumped = CLUMP_MARK in lines[h:h + 3] or SEAM_BEGIN in body
         self.imports = imports
         # Size counts the body plus seam overhead; imports are deduplicated in the clump header.
-        stack, self.decls = scan(self.body)
-        self.lines = self.body.count("\n") + 6 + len(stack)
+        scopes, self.decls = scan(body)
+        self.lines = body.count("\n") + 6 + len(scopes)
         self.exotic = exotic
+        # A plan needs the import graph and declaration names, but not the Lean source.
+        if keep_source:
+            self.header = "\n".join(lines[:h]) + ("\n" if h < len(lines) else "")
+            self.body = body
+            self.scopes = scopes
 
 
-def load(root):
+def load(root, *, names=None, keep_source=True):
     out = subprocess.run(["git", "-C", root, "ls-files", "-z", "src/*.lean"],
                          capture_output=True, check=True).stdout.decode()
     mods = {}
@@ -106,13 +111,31 @@ def load(root):
         if not p:
             continue
         name = p[len("src/"):-len(".lean")].replace("/", ".")
+        if names is not None and name not in names:
+            continue
         with open(os.path.join(root, p), encoding="utf-8") as f:
-            mods[name] = Module(name, p, f.read())
+            mods[name] = Module(name, p, f.read(), keep_source=keep_source)
     return mods
 
 
 # ---------------------------------------------------------------------------
 # Planning
+
+def merge_sets(a, b):
+    """Reuse the larger owned set when two clumps become one."""
+    if len(a) < len(b):
+        a, b = b, a
+    a.update(b)
+    return a
+
+
+class Clump:
+    def __init__(self, mod):
+        self.lines = mod.lines
+        self.imports = {name for name, _ in mod.imports}
+        self.decls = mod.decls.copy()
+        self.members = {mod.name}
+
 
 def plan(mods, max_lines, exclude=frozenset()):
     deps = {m: list(dict.fromkeys(x for x, _ in mods[m].imports if x in mods)) for m in mods}
@@ -139,43 +162,37 @@ def plan(mods, max_lines, exclude=frozenset()):
     if len(order) != len(mods):
         sys.exit("import graph has a cycle")
 
-    members = {m: [m] for m in mods}
-    body = {m: mods[m].lines for m in mods}  # summed body lines of the clump rooted here
-    imps = {m: {x for x, _ in mods[m].imports} for m in mods}  # union of members' imports
-    names = {m: mods[m].decls for m in mods}  # top-level declaration names in the clump
-
-    def total(b, i, mem):  # output lines: header (deduplicated imports) + bodies
-        return b + len(i) - len(mem) + 6
-
-    absorbed = set()
-    clashes = [0]
+    # A single module needs no aggregate state until we try folding it into a clump.
+    groups = {}
+    clashes = 0
     for v in order:
         if not clumpable(v):
             continue
         kids = [c for c in deps[v]
                 if rev[c] == [v] and clumpable(c) and lib_of(c) == lib_of(v)]
-        kids.sort(key=lambda c: (body[c], c))
-        for c in kids:
-            b = body[v] + body[c]
-            i = imps[v] | imps[c]
-            mem = members[v] + members[c]
-            if total(b, i, mem) > max_lines:
-                continue
-            if not names[v].isdisjoint(names[c]):
-                # Declarations that coexisted in separate modules (private ones, or
-                # duplicates that no single module ever imported together) clash in one file.
-                clashes[0] += 1
-                continue
-            body[v], imps[v], members[v] = b, i, mem
-            names[v] = names[v] | names[c]
-            absorbed.add(c)
-    print(f"refused {clashes[0]} folds because of clashing declaration names", file=sys.stderr)
-    clumps = {}
-    for r in mods:
-        if r in absorbed or len(members[r]) == 1:
+        if not kids:
             continue
-        clumps[r] = linearise(r, set(members[r]), deps)
-    return clumps
+        kids.sort(key=lambda c: (groups[c].lines if c in groups else mods[c].lines, c))
+        group = Clump(mods[v])
+        for c in kids:
+            child = groups.get(c) or Clump(mods[c])
+            lines = group.lines + child.lines
+            n_imports = len(group.imports) + len(child.imports) - len(group.imports & child.imports)
+            # Deduplicate the import header and count each member's seam overhead.
+            if lines + n_imports - len(group.members) - len(child.members) + 6 > max_lines:
+                continue
+            if not group.decls.isdisjoint(child.decls):
+                # Declarations that coexisted in separate modules can clash in one file.
+                clashes += 1
+                continue
+            group.lines = lines
+            group.imports = merge_sets(group.imports, child.imports)
+            group.decls = merge_sets(group.decls, child.decls)
+            group.members = merge_sets(group.members, child.members)
+            groups.pop(c, None)
+            groups[v] = group
+    print(f"refused {clashes} folds because of clashing declaration names", file=sys.stderr)
+    return {r: linearise(r, groups[r].members, deps) for r in mods if r in groups}
 
 
 def linearise(root, mem, deps):
@@ -247,8 +264,8 @@ def scan(body):
                                 ns = ".".join(n for k, n in stack if k == "namespace")
                                 decls.add(ns + "." + name if ns else name)
         # crude block-comment tracking (ignores comment markers inside strings)
-        depth += l.count("/-") - l.count("-/")
-        depth = max(depth, 0)
+        if "/" in l:
+            depth = max(0, depth + l.count("/-") - l.count("-/"))
     return stack, decls
 
 
@@ -269,7 +286,7 @@ def closers(stack):
 # Applying
 
 def is_clump_file(mod):
-    return CLUMP_MARK in mod.body.split("\n", 3)[0:3] or SEAM_BEGIN in mod.body
+    return mod.clumped
 
 
 def render(root, order, mods):
@@ -303,7 +320,7 @@ def render(root, order, mods):
         out.append(HEADER_TAG + json.dumps(info, ensure_ascii=False))
         out.append("section" + AUTO)
         out.append(body)
-        out += closers(open_scopes(body))
+        out += closers(mod.scopes)
         out.append("end" + AUTO)
         out.append(SEAM_END + m + " =====")
         out.append("")
@@ -311,7 +328,18 @@ def render(root, order, mods):
 
 
 def apply(root, clumps):
-    mods = load(root)
+    names = set()
+    for r, order in clumps.items():
+        if r not in order:
+            raise ValueError(f"clump does not contain its own module: {r}")
+        for m in order:
+            if m in names:
+                raise ValueError(f"duplicate clump member: {m}")
+            names.add(m)
+    mods = load(root, names=names)
+    missing = names - mods.keys()
+    if missing:
+        raise ValueError("missing clump members: " + ", ".join(sorted(missing)))
     for r, order in clumps.items():
         text = render(r, order, mods)
         for m in order:
@@ -429,7 +457,7 @@ def main():
     u = sub.add_parser("unclump"); u.add_argument("root")
     args = ap.parse_args()
     if args.cmd == "plan":
-        mods = load(args.root)
+        mods = load(args.root, keep_source=False)
         clumps = plan(mods, args.max_lines, read_exclude(args.exclude))
         stats(mods, clumps, args.max_lines)
         if args.out:
