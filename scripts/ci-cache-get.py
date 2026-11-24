@@ -7,13 +7,14 @@ immutable map and module manifest are checked against the receipt's SHA-256 valu
 each other. Then, at the same time, the map is registered with `lake cache add` in parallel
 shards and the missing artifacts are downloaded by one 500-way curl process, each checked
 against the manifest's SHA-256 before it enters the cache (scripts/rh-buildq/fetch-artifacts.py).
-Then one stock leantar process unpacks every module (after path checks), and `lake build
---no-build` confirms that nothing would have to be compiled.
+With module names, only those modules and their imports are restored. One stock leantar process
+unpacks the selected modules (after path checks), and `lake build --no-build` checks the targets.
 
 Exit 3 means no equivalent successful CI receipt was found. Other failures must
 not silently fall back: a matching receipt with corrupt bytes is an error.
 """
 import argparse
+import errno
 import gzip
 import hashlib
 import http.client
@@ -395,7 +396,49 @@ def download_failure(code, report):
     return f"{reason}. {advice[0].upper()}{advice[1:]}"
 
 
-def consume(root, cache, record, identity, workers=24, fetcher=fetch):
+def import_headers(root, paths, env):
+    """Use the pinned Lean header parser, without elaborating or importing a module."""
+    result = subprocess.run(["elan", "run", env["ELAN_TOOLCHAIN"], "lean", "--deps-json", "--stdin"],
+                            cwd=root, env=env,
+                            input="".join(f"{path}\n" for path in paths), stdout=subprocess.PIPE,
+                            text=True, check=True)
+    for path, header in zip(paths, json.loads(result.stdout)["imports"], strict=True):
+        if header.get("errors") or "result" not in header:
+            raise ValueError(f"could not read imports from {path}: {header.get('errors')}")
+        yield [item["module"] for item in header["result"]["imports"]]
+
+
+def target_imports(root, targets, modules, env):
+    """Collect the project modules to unpack and the package imports they need."""
+    available = {name for name, _, _ in modules}
+    pending = set(targets)
+    missing = pending - available
+    if missing:
+        raise ValueError(f"project modules absent from the published cache: {', '.join(sorted(missing))}")
+    selected, external, checked = set(), set(), set()
+    while pending:
+        selected.update(pending)
+        paths = []
+        for name in sorted(pending):
+            relative = Path("src", *name.split(".")).with_suffix(".lean")
+            if not local_path(root, relative, checked).is_file():
+                raise ValueError(f"missing source for {name}")
+            paths.append(relative)
+        imports = {name for header in import_headers(root, paths, env) for name in header}
+        pending = (imports & available) - selected
+        for name in imports - available - external:
+            if not MODULE.fullmatch(name):
+                raise ValueError(f"unsupported imported module name: {name}")
+            relative = Path("src", *name.split(".")).with_suffix(".lean")
+            if local_path(root, relative, checked).exists():
+                raise ValueError(f"imported project module absent from the published cache: {name}")
+            external.add(name)
+    # Lean ships these libraries with the toolchain.
+    packages = sorted(name for name in external if name.partition(".")[0] not in {"Init", "Lean", "Std", "Lake"})
+    return selected, packages
+
+
+def consume(root, cache, record, identity, workers=24, fetcher=fetch, *, targets=()):
     contents, shas, modules = validated_blobs(record, identity, fetcher)
     if current_identity(root) != identity:
         raise ValueError("project inputs changed during cache lookup")
@@ -413,14 +456,32 @@ def consume(root, cache, record, identity, workers=24, fetcher=fetch):
                LAKE_RESTORE_ARTIFACTS="true", ELAN_TOOLCHAIN=identity["toolchain"])
     env["RUST_MIN_STACK"] = str(max(int(env.get("RUST_MIN_STACK", "0")), 8388608))
     service = tomllib.loads((root / "lakefile.toml").read_text()).get("cache", {}).get("defaultService")
-    entries = [decode(line) for line in contents.splitlines()[1:]]
+    targets = list(dict.fromkeys(targets))
+    if targets:
+        selected, packages = target_imports(root, targets, modules, env)
+        if packages:
+            command = ["lake", "exe", "mathlib/cache", "get"]
+            try:
+                subprocess.run([*command, *packages], cwd=root, env=env, check=True)
+            except OSError as error:
+                if error.errno != errno.E2BIG:
+                    raise
+                subprocess.run(command, cwd=root, env=env, check=True)
+        modules = [row for row in modules if row[0] in selected]
+        entries = [(input_hash, artifact) for _, input_hash, artifact in modules]
+        shas = {artifact: shas[artifact] for _, artifact in entries}
+    else:
+        entries = [decode(line) for line in contents.splitlines()[1:]]
     have = registered(cache, entries)
     fresh = [entry for entry in entries if entry[0] not in have]
     print(f"Fetching successful CI cache {record['candidate_head']} for current build inputs: "
           f"{len(entries)} modules, {len(fresh)} not yet registered...", flush=True)
     with tempfile.TemporaryDirectory(prefix="ci-cache-", dir=root / ".lake") as temporary:
         temporary = Path(temporary)
-        (temporary / "outputs.jsonl").write_bytes(contents)
+        if targets:
+            write_map(temporary / "outputs.jsonl", entries)
+        else:
+            (temporary / "outputs.jsonl").write_bytes(contents)
         (temporary / "sha256.json").write_text(json.dumps(shas))
         downloads = subprocess.Popen(
             [sys.executable, "-I", str(FETCH_ARTIFACTS), str(temporary / "outputs.jsonl"), str(cache),
@@ -456,8 +517,9 @@ def consume(root, cache, record, identity, workers=24, fetcher=fetch):
     print(f"Unpacking {len(jobs)} modules with stock leantar ({workers} workers)...", flush=True)
     subprocess.run([str(lean.with_name("leantar")), "--jobs", str(workers), "-f", "-x", "-j", "-"],
                    input=json.dumps(jobs), text=True, cwd=root, env=env, check=True)
-    print("Checking with lake build --no-build...", flush=True)
-    result = subprocess.run(["lake", "-q", "--log-level=error", "build", "--no-build"], cwd=root, env=env)
+    check = ["build", "--no-build", *("+" + target for target in targets)]
+    print(f"Checking with lake {' '.join(check)}...", flush=True)
+    result = subprocess.run(["lake", "-q", "--log-level=error", *check], cwd=root, env=env)
     if result.returncode:
         raise ValueError(f"lake build --no-build exited {result.returncode} after restoring the cache"
                          " (exit 3: some modules would need compiling)")
@@ -493,10 +555,16 @@ def main():
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--ancestor-limit", type=int, default=100)
     parser.add_argument("--jobs", type=int, default=24)
+    parser.add_argument("targets", nargs="*", metavar="MODULE", help="restore a project module and its imports")
     args = parser.parse_args()
     if args.jobs < 1 or not 1 <= args.ancestor_limit <= 1000:
         parser.error("jobs must be positive; ancestor limit must be 1..1000")
+    if any(not MODULE.fullmatch(name) for name in args.targets):
+        parser.error("targets must be dotted Lean module names")
     root = args.project.resolve()
+    for name in args.targets:
+        if not (root / "src" / Path(*name.split(".")).with_suffix(".lean")).is_file():
+            parser.error(f"no project module named {name}")
     identity = current_identity(root)
     record = find_record(root, identity, args.ancestor_limit)
     cached = {}
@@ -507,7 +575,8 @@ def main():
         return 3
     cache = (args.cache_dir or Path(os.environ.get("LAKE_CACHE_DIR", str(root / ".lake/cache")))).resolve()
     consume(root, cache, record, identity, args.jobs,
-            fetcher=lambda key, maximum=MAX_JSON: cached[key] if key in cached else fetch(key, maximum))
+            fetcher=lambda key, maximum=MAX_JSON: cached[key] if key in cached else fetch(key, maximum),
+            targets=args.targets)
     return 0
 
 
