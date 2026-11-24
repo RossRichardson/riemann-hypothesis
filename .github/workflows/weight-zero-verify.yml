@@ -1,0 +1,61 @@
+name: Verify weight-zero period matrices
+on:
+  push:
+    branches: [verify-weight-zero-periods]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      ELAN_TOOLCHAIN: leanprover/lean4:v4.37.0-rc1
+      LEAN_NUM_THREADS: '1'
+      LEAN_ABORT_ON_PANIC: '1'
+      BASE_SHA: 6866a9c6260d77b88a7b5477433e3044b6844f9b
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Check out verifier and candidate proof
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: candidate
+          persist-credentials: false
+      - name: Check out upstream source and trusted cache helpers
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: leanprover-community/riemann-hypothesis
+          ref: ${{ env.BASE_SHA }}
+          path: baseline
+          persist-credentials: false
+      - name: Install Lean and check the build sandbox
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP"
+          if ! command -v bwrap >/dev/null; then
+            cd "$RUNNER_TEMP"
+            apt-get download bubblewrap
+            dpkg-deb -x ./bubblewrap_*.deb weight-zero-bwrap
+            export PATH="$RUNNER_TEMP/weight-zero-bwrap/usr/bin:$PATH"
+            echo "$RUNNER_TEMP/weight-zero-bwrap/usr/bin" >> "$GITHUB_PATH"
+          fi
+          bwrap --unshare-all --ro-bind / / -- /usr/bin/true
+          curl -fsSL --retry 3 https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install "$ELAN_TOOLCHAIN"
+      - name: Compile the original and shared proofs
+        run: |
+          set -euo pipefail
+          ulimit -n 65536
+          python3 candidate/.github/workflows/weight-zero-verify.py
+      - name: Save build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: weight-zero-verification
+          path: ${{ runner.temp }}/weight-zero-results
+          if-no-files-found: warn
+          retention-days: 7
