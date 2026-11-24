@@ -25,6 +25,11 @@ These caches include outputs from **untrusted pull requests and volunteer machin
 
 For independent verification or fetching Mathlib alone, use `lake exe mathlib/cache get`, which bypasses this project's combined entry point.
 
+To work on individual modules, pass one or more dotted project module names after `get`.
+The client verifies the full receipt and manifest, restores the named modules and their
+transitive imports, and runs `lake build --no-build` on those targets. A later plain
+`lake exe cache get` can fill in the rest of the project from the same cache.
+
 ## Publish a completed cache
 
 Publish a directory staged by `stage-completed-build.py`, with its module index and receipt, from a separate host holding the upload credential:
