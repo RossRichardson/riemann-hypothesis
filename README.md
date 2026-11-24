@@ -51,6 +51,14 @@ A full build makes Lean check every proof on your machine. The cache downloads f
 compiled elsewhere, so you can read and edit the project within minutes, but Lean does not
 re-check them.
 
+To open just the module on the `p`-adic logarithm and its imports, run
+
+```bash
+lake exe cache get GroundTheory.LocalFields.PadicLogSeries
+```
+
+You can pass several module names in one command.
+
 ## Checking the proof yourself
 
 Take a fresh clone on a Linux machine with
