@@ -169,20 +169,20 @@ def select_module_entries(manifest, entries, names):
     return {row[1]: row[2] for row in rows.values() if row[0] in names}
 
 
-def downloads(cache, entries, sha256s):
+def downloads(cache, sha256s):
     artifacts = cache / "artifacts"
     if artifacts.is_symlink():
         raise ValueError("Cache artifacts must be a real directory")
     artifacts.mkdir(parents=True, exist_ok=True)
     missing = []
-    for name in sorted(set(entries.values())):
+    for name in sorted(sha256s):
         path = artifacts / name
-        if (not LTAR.fullmatch(name) or not isinstance(sha256s.get(name), str) or
-                not publication.SHA256.fullmatch(sha256s[name])):
+        expected = sha256s[name]
+        if not LTAR.fullmatch(name) or not isinstance(expected, str) or not publication.SHA256.fullmatch(expected):
             raise ValueError("Invalid archive filename or missing manifest digest")
         if path.is_file() and not path.is_symlink():
             with path.open("rb") as stream:
-                valid = hashlib.file_digest(stream, "sha256").hexdigest() == sha256s[name]
+                valid = hashlib.file_digest(stream, "sha256").hexdigest() == expected
             if valid:
                 continue
         missing.append(name)
@@ -201,12 +201,9 @@ def downloads(cache, entries, sha256s):
             path = temp / name
             if not path.is_file() or not path.stat().st_size:
                 raise ValueError("Missing downloaded archive")
-            if name in sha256s:
-                with path.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != sha256s[name]:
-                        raise ValueError("Downloaded archive SHA256 mismatch")
-            else:
-                raise ValueError("Archive missing manifest digest")
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != sha256s[name]:
+                    raise ValueError("Downloaded archive SHA256 mismatch")
             path.chmod(0o444)
             os.replace(path, artifacts / name)
 
@@ -234,7 +231,8 @@ def previous_cache_revisions(candidate, request):
     return list(dict.fromkeys([head, *branch, *fallback]))
 
 
-def restore_previous_cache(candidate, request, cache):
+def prepare_full_cache(candidate, request, cache, baseline_hashes):
+    """Verify the union of pinned and previous archives before exposing the previous map."""
     for revision in previous_cache_revisions(candidate, request):
         record_data = get(f"{BASE}/ci/revisions/{revision}.json", missing=True, maximum=2_000_000)
         if record_data is None:
@@ -249,12 +247,16 @@ def restore_previous_cache(candidate, request, cache):
         if digest(data) != record["map_sha256"] or digest(module_data) != record["module_manifest_sha256"]:
             raise ValueError("Published CI cache integrity mismatch")
         latest = mapping(data)
-        extra_hashes = manifest_hashes(module_data, latest, data, record)
-        downloads(cache, latest, extra_hashes)
+        hashes = manifest_hashes(module_data, latest, data, record)
+        for name, expected in baseline_hashes.items():
+            if hashes.setdefault(name, expected) != expected:
+                raise ValueError(f"Conflicting archive digests for {name}")
+        downloads(cache, hashes)
         selected = cache / "latest.jsonl"
         selected.write_bytes(data)
         print(f"Reusing previous CI cache {revision}", flush=True)
         return selected
+    downloads(cache, baseline_hashes)
     return None
 
 
@@ -295,18 +297,19 @@ def prepare(args):
         entries = mapping(map_data)
         hashes = manifest_hashes(manifest, entries, map_data)
         quick_plan = getattr(args, "quick_plan", None)
+        request = json.loads(Path(args.request).read_text())
         if quick_plan:
             plan = json.loads(Path(quick_plan).read_text())
-            request = json.loads(Path(args.request).read_text())
             if plan.get("candidate_head") != request["expected"]["candidate_head"] or plan.get("status") != "ready":
                 raise ValueError("quick plan does not bind the resolved candidate")
             names = set(plan["closure"])
             if not names or len(names) > 2000:
                 raise ValueError("quick plan exceeds its dependency budget")
             entries = select_module_entries(manifest, entries, names)
-        downloads(cache, entries, hashes)
-        request = json.loads(Path(args.request).read_text())
-        selected = None if quick_plan else restore_previous_cache(args.candidate, request, cache)
+            downloads(cache, {name: hashes[name] for name in entries.values()})
+            selected = None
+        else:
+            selected = prepare_full_cache(args.candidate, request, cache, hashes)
         paths = {"packages": str(deps / ".lake/packages"), "baseline_cache": str(cache),
                  "baseline_manifest": str(cache / "modules.jsonl.gz"), "baseline_map": str(cache / "outputs.jsonl"),
                  "latest_map": str(selected) if selected else ""}
