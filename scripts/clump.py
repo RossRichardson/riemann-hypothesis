@@ -20,7 +20,8 @@ namespaces it left open closed explicitly:
 
 `clump.py unclump` splits clump files back into the original files, byte for byte, provided
 the member bodies were not edited.  If they were, it still restores the edited bodies; the
-original import headers are restored as recorded.
+original import headers are restored as recorded. If a restored file already exists with
+different contents, unclumping stops before changing any files.
 
 Usage:
     clump.py plan   ROOT [--max-lines N] [--out plan.json]
@@ -340,29 +341,79 @@ def unclump_text(text):
             k += 1
         body = [l for l in lines[j + 1:k] if not l.endswith(AUTO)]
         body = "\n".join(body) + ("" if info.get("nonl") else "\n")
+        if name in out:
+            raise ValueError(f"duplicate clump member: {name}")
         out[name] = info["h"] + body
         i = k + 1
     return out
 
 
+def restored_members(root, text):
+    return {os.path.join(root, "src", *name.split(".")) + ".lean": content
+            for name, content in unclump_text(text).items()}
+
+
+def check_restored_file(path, content):
+    if not os.path.islink(path) and os.path.isfile(path):
+        with open(path, "rb") as f:
+            if f.read() == content.replace("\n", os.linesep).encode("utf-8"):
+                return
+    raise ValueError(f"cannot unclump: existing file differs or is not a regular file: {path}")
+
+
+def file_version(f):
+    st = os.fstat(f.fileno())
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
 def unclump(root):
+    root = os.path.abspath(root)
     out = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others",
                           "--exclude-standard", "src/*.lean"],
                          capture_output=True, check=True).stdout.decode()
-    n = 0
+    # Preflight the whole worktree without retaining the bodies of every clump.
+    clumps, destinations = {}, set()
     for p in out.split("\0"):
-        if not p or not os.path.exists(os.path.join(root, p)):
+        path = os.path.normpath(os.path.join(root, p))
+        if not p or not os.path.isfile(path):
             continue
-        with open(os.path.join(root, p), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
+            version = file_version(f)
             text = f.read()
         if CLUMP_MARK not in text:
             continue
-        for name, content in unclump_text(text).items():
-            q = os.path.join(root, "src", *name.split(".")) + ".lean"
-            with open(q, "w", encoding="utf-8") as f:
-                f.write(content)
-        n += 1
-    print(f"unclumped {n} files")
+        if os.path.islink(path):
+            raise ValueError(f"cannot unclump a symbolic link: {path}")
+        members = restored_members(root, text)
+        if path not in members:
+            raise ValueError(f"clump does not contain its own module: {path}")
+        for target, content in members.items():
+            if target in destinations:
+                raise ValueError(f"duplicate unclump destination: {target}")
+            destinations.add(target)
+            if target != path and os.path.lexists(target):
+                check_restored_file(target, content)
+        clumps[path] = version
+
+    for path, version in clumps.items():
+        with open(path, "r+", encoding="utf-8") as source:
+            if os.path.islink(path) or file_version(source) != version:
+                raise ValueError(f"clump changed while unclumping: {path}")
+            members = restored_members(root, source.read())
+            root_content = members.pop(path)
+            for target, content in members.items():
+                try:
+                    with open(target, "x", encoding="utf-8") as f:
+                        f.write(content)
+                except FileExistsError:
+                    check_restored_file(target, content)
+            # Replace the clump only after every other member is in place.
+            if file_version(source) != version:
+                raise ValueError(f"clump changed while unclumping: {path}")
+            source.seek(0)
+            source.write(root_content)
+            source.truncate()
+    print(f"unclumped {len(clumps)} files")
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +492,10 @@ def main():
     elif args.cmd == "blame":
         print("\n".join(blame(args.root, args.logs)))
     else:
-        unclump(args.root)
+        try:
+            unclump(args.root)
+        except ValueError as exc:
+            sys.exit(str(exc))
 
 
 if __name__ == "__main__":
