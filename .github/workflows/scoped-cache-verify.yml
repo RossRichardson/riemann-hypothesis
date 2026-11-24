@@ -1,0 +1,131 @@
+name: Verify the scoped public cache
+on:
+  push:
+    branches: [verify-scoped-cache]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'RossRichardson/riemann-hypothesis'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      TARGET: Development.AutomorphicArithmetic.AutomorphicVarieties.PadicHodgeTheory.WtMatFix
+      LEAN_NUM_THREADS: '1'
+      LEAN_ABORT_ON_PANIC: '1'
+      MATHLIB_CACHE_GET_URL: https://cache.mathlib.org/mathlib4
+    steps:
+      - name: Prepare storage and memory on the disposable GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo sysctl -w vm.max_map_count=1048576
+          swapfile="$RUNNER_TEMP/lake.swap"
+          sudo fallocate -l 24G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+          free -h
+
+          # Keep the toolchain, dependencies, and unpacked Lean files on a compressed volume.
+          volume="$GITHUB_WORKSPACE/build-volume"
+          mkdir -p "$volume"
+          if ! command -v mkfs.btrfs >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends btrfs-progs
+          fi
+          image="$RUNNER_TEMP/lake.btrfs"
+          free_mib=$(df -Pm "$RUNNER_TEMP" | awk 'END {print $4}')
+          truncate -s "$((free_mib - 6144))M" "$image"
+          sudo mkfs.btrfs -f -m single "$image"
+          if sudo mount -o loop,compress-force=zstd:3,noatime "$image" "$volume"; then
+            sudo chown "$(id -u):$(id -g)" "$volume"
+          else
+            echo "Compressed mount unavailable. Using the runner filesystem."
+            rm -f -- "$image"
+          fi
+          mkdir -p "$volume/elan" "$volume/cache" "$volume/tmp"
+          {
+            echo "ELAN_HOME=$volume/elan"
+            echo "XDG_CACHE_HOME=$volume/cache"
+            echo "TMPDIR=$volume/tmp"
+          } >> "$GITHUB_ENV"
+          echo "$volume/elan/bin" >> "$GITHUB_PATH"
+          df -h "$volume"
+
+      - name: Select Python for the upstream cache client
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Check out the verification branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: build-volume/repo
+          persist-credentials: false
+      - name: Install the repository's pinned Lean toolchain
+        working-directory: build-volume/repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="$RUNNER_TEMP/elan.tar.gz"
+          curl --fail --location --silent --show-error --retry 3 \
+            https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz -o "$file"
+          echo "0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2  $file" | sha256sum --check
+          tar xzf "$file" -C "$RUNNER_TEMP" elan-init
+          "$RUNNER_TEMP/elan-init" -y --default-toolchain none --no-modify-path
+          elan toolchain install "$(cat lean-toolchain)"
+          lean --version
+          lake --version
+
+      - name: Run the cache client regression tests against stock Lean
+        working-directory: build-volume/repo
+        run: |
+          set -euo pipefail
+          ulimit -Sn 65536
+          python3 -B scripts/tests/test_audit_clients.py
+          python3 -B scripts/tests/test_lake_cache_get.py
+          python3 -B scripts/tests/test_ci_cache_get.py
+
+      - name: Inventory the successful public receipt and its project import closure
+        working-directory: build-volume/repo
+        run: |
+          mkdir -p "$RUNNER_TEMP/scoped-results"
+          python3 .github/workflows/scoped-cache-measure.py receipt
+
+      - name: Restore one mathematical module into a cold checkout
+        working-directory: build-volume/repo
+        run: |
+          set -euo pipefail
+          ulimit -Sn 65536
+          test ! -d .lake/cache/artifacts
+          /usr/bin/time -v -o "$RUNNER_TEMP/scoped-results/scoped.time" lake exe cache get "$TARGET" | tee "$RUNNER_TEMP/scoped-results/scoped.log"
+          env LAKE_ARTIFACT_CACHE=false LAKE_RESTORE_ARTIFACTS=false lake build --no-build "+$TARGET"
+          if env LAKE_ARTIFACT_CACHE=false LAKE_RESTORE_ARTIFACTS=false lake build --no-build +Statements; then
+            echo "Unrelated Statements module unexpectedly built" >&2
+            exit 1
+          else
+            test "$?" -eq 3
+          fi
+          python3 .github/workflows/scoped-cache-measure.py scoped
+
+      - name: Extend the partial cache to a complete build
+        working-directory: build-volume/repo
+        run: |
+          set -euo pipefail
+          ulimit -Sn 65536
+          /usr/bin/time -v -o "$RUNNER_TEMP/scoped-results/full-after-scoped.time" lake exe cache get | tee "$RUNNER_TEMP/scoped-results/full-after-scoped.log"
+          /usr/bin/time -v -o "$RUNNER_TEMP/scoped-results/plain-build.time" lake build
+          python3 .github/workflows/scoped-cache-measure.py full
+
+      - name: Upload counts, bytes and stock Lake logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scoped-cache-verification
+          path: ${{ runner.temp }}/scoped-results
+          if-no-files-found: warn
