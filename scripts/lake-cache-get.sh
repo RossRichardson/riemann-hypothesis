@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" != 1 || "$1" != get ]]; then
-  echo 'Usage: lake exe cache get' >&2
+if [[ "${1:-}" != get ]]; then
+  echo 'Usage: lake exe cache get [Module.Name ...]' >&2
   exit 2
 fi
+shift
 
 RH_CACHE_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$RH_CACHE_ROOT"
@@ -30,17 +31,18 @@ if ! ulimit -Sn "$RH_CACHE_FD_WANT" 2>/dev/null; then
   fi
 fi
 
-# Qualify Mathlib's executable because this package also supplies a cache target.
-printf 'Fetching Mathlib cache...\n'
-MATHLIB_CACHE_GET_URL="${MATHLIB_CACHE_GET_URL:-https://cache.mathlib.org/mathlib4}" \
+export MATHLIB_CACHE_GET_URL="${MATHLIB_CACHE_GET_URL:-https://cache.mathlib.org/mathlib4}"
+if [[ "$#" == 0 ]]; then
+  printf 'Fetching Mathlib cache...\n'
   lake exe mathlib/cache get
+fi
 
 # Cache URLs live in lakefile.toml; users need no separate configuration file.
 # ci-cache-get.py registers the map, downloads and checks the artifacts (500 parallel transfers),
 # unpacks them with one leantar process, then checks with `lake build --no-build`.
 export LAKE_CACHE_DIR="$RH_CACHE_ROOT/.lake/cache"
 RH_CI_CACHE_STATUS=0
-python3 scripts/ci-cache-get.py || RH_CI_CACHE_STATUS=$?
+python3 scripts/ci-cache-get.py -- "$@" || RH_CI_CACHE_STATUS=$?
 if [[ "$RH_CI_CACHE_STATUS" == 3 ]]; then
   echo 'No validated cache matches these build inputs; use lake build.' >&2
 fi
